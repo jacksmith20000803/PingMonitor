@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>disable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>PingMonitor_v2</AssemblyName>
+    <RootNamespace>PingMonitor</RootNamespace>
+    <Version>1.1.0</Version>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <AssemblyTitle>Ping Monitor</AssemblyTitle>
+    <AssemblyCompany>Your Name</AssemblyCompany>
+    <AssemblyProduct>Ping Monitor</AssemblyProduct>
+    <AssemblyCopyright>Copyright © 2025</AssemblyCopyright>
+  </PropertyGroup>
+</Project>
