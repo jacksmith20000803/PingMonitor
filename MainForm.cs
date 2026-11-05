@@ -2,6 +2,7 @@ using System;
 using System.Drawing;
 using System.IO;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -15,10 +16,6 @@ public class MainForm : Form
 
     private const int H = 90;
 
-    private const int HeaderH = 18;
-
-    private const int ValueH = 24;
-
     private string _host;
 
     private readonly int[] _bars = new int[60];
@@ -28,6 +25,8 @@ public class MainForm : Form
     private int _head;
 
     private bool _drag;
+
+    private bool _pingInProgress;
 
     private Point _dragPt;
 
@@ -39,11 +38,25 @@ public class MainForm : Form
 
     private readonly Label _value;
 
+    private readonly Label _usageValue;
+
+    private readonly ToolTip _usageTip = new ToolTip();
+
+    private readonly NetworkUsageTracker _usage;
+
     private readonly NotifyIcon _tray;
+
+    private readonly Icon _trayIcon;
 
     private readonly System.Windows.Forms.Timer _timer;
 
+    private readonly System.Windows.Forms.Timer _usageTimer;
+
     private static string HostFilePath => Path.Combine(AppContext.BaseDirectory, "pinghost.txt");
+
+    private static string UsageFilePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PingMonitor", "network-usage.json");
 
     public MainForm(string initialHost = null)
     {
@@ -53,17 +66,19 @@ public class MainForm : Form
         if (string.IsNullOrEmpty(_host))
             _host = DefaultHost;
 
-        base.ClientSize = new Size(180, 90);
+        _usage = new NetworkUsageTracker(UsageFilePath);
+
+        base.ClientSize = new Size(W, H);
         base.FormBorderStyle = FormBorderStyle.None;
         BackColor = Color.FromArgb(28, 30, 36);
         base.TopMost = true;
         base.ShowInTaskbar = false;
         base.StartPosition = FormStartPosition.Manual;
-        base.Location = new Point(Screen.PrimaryScreen.WorkingArea.Right - 180 - 16, Screen.PrimaryScreen.WorkingArea.Top + 16);
+        base.Location = new Point(Screen.PrimaryScreen.WorkingArea.Right - W - 16, Screen.PrimaryScreen.WorkingArea.Top + 16);
         _title = new Label
         {
             Location = new Point(4, 0),
-            Size = new Size(158, 18),
+            Size = new Size(106, 18),
             Text = _host,
             Font = new Font("Segoe UI", 8f, FontStyle.Bold),
             ForeColor = Color.Gainsboro,
@@ -121,32 +136,58 @@ public class MainForm : Form
         _graph = new Panel
         {
             Location = new Point(0, 18),
-            Size = new Size(180, 48),
+            Size = new Size(W, 48),
             BackColor = Color.FromArgb(18, 20, 24)
         };
         _graph.Paint += DrawBars;
-        // NEW: right-click graph also opens host setting (does not alter look)
-        _graph.MouseClick += delegate (object s, MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Right) ShowSetHostDialog();
-        };
         _value = new Label
         {
             Location = new Point(0, 66),
-            Size = new Size(180, 24),
+            Size = new Size(W, 24),
             Font = new Font("Segoe UI", 10f, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleCenter,
             ForeColor = Color.FromArgb(80, 200, 255),
             BackColor = Color.FromArgb(28, 30, 36),
             Text = "-- ms"
         };
+        _usageValue = new Label
+        {
+            Location = new Point(110, 0),
+            Size = new Size(50, 18),
+            Font = new Font("Segoe UI", 8f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleRight,
+            ForeColor = Color.FromArgb(80, 200, 255),
+            BackColor = Color.FromArgb(40, 44, 52)
+        };
+        _usageTip.SetToolTip(_usageValue, "Network usage in the current reset cycle");
+        UpdateUsageDisplay();
+
+        var widgetMenu = new ContextMenuStrip();
+        widgetMenu.Items.Add("Network Data", null, delegate { ShowNetworkData(); });
+        widgetMenu.Items.Add("Set Reset Time...", null, delegate { ShowSetResetTimeDialog(); });
+        widgetMenu.Items.Add("Set Host...", null, delegate { ShowSetHostDialog(); });
+        widgetMenu.Items.Add("Hide", null, delegate { Hide(); });
+        widgetMenu.Items.Add("Exit", null, delegate
+        {
+            _tray.Visible = false;
+            Application.Exit();
+        });
+        base.ContextMenuStrip = widgetMenu;
+        _title.ContextMenuStrip = widgetMenu;
+        _close.ContextMenuStrip = widgetMenu;
+        _graph.ContextMenuStrip = widgetMenu;
+        _value.ContextMenuStrip = widgetMenu;
+        _usageValue.ContextMenuStrip = widgetMenu;
+
         base.Controls.Add(_title);
         base.Controls.Add(_close);
         base.Controls.Add(_graph);
         base.Controls.Add(_value);
+        base.Controls.Add(_usageValue);
+        _trayIcon = MakeIcon();
         _tray = new NotifyIcon
         {
-            Icon = MakeIcon(),
+            Icon = _trayIcon,
             Visible = true,
             Text = "Ping Monitor - " + _host
         };
@@ -154,6 +195,16 @@ public class MainForm : Form
         {
             Items =
             {
+                {
+                    "Network Data",
+                    (Image)null,
+                    (EventHandler)delegate { ShowNetworkData(); }
+                },
+                {
+                    "Set Reset Time...",
+                    (Image)null,
+                    (EventHandler)delegate { ShowSetResetTimeDialog(); }
+                },
                 {
                     "Set Host...",
                     (Image)null,
@@ -198,6 +249,15 @@ public class MainForm : Form
             await Tick();
         };
         _timer.Start();
+        _usageTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        _usageTimer.Tick += delegate
+        {
+            _usage.Sample();
+            UpdateUsageDisplay();
+            CheckDailyUsageAlert();
+        };
+        _usageTimer.Start();
+        CheckDailyUsageAlert();
     }
 
     private static string NormalizeHost(string host)
@@ -265,39 +325,117 @@ public class MainForm : Form
 
     private async Task Tick()
     {
-        int num;
+        if (_pingInProgress)
+            return;
+
+        _pingInProgress = true;
         try
         {
-            Ping ping = new Ping();
+            int num;
             try
             {
+                using Ping ping = new Ping();
                 PingReply pingReply = await ping.SendPingAsync(_host, 2000);
-                num = (int)((pingReply.Status == IPStatus.Success) ? pingReply.RoundtripTime : (-1));
+                num = pingReply.Status == IPStatus.Success ? (int)pingReply.RoundtripTime : -1;
             }
-            finally
+            catch
             {
-                ((IDisposable)ping)?.Dispose();
+                num = -1;
             }
+
+            _bars[_head] = num;
+            _head = (_head + 1) % MaxBars;
+            if (_count < MaxBars)
+                _count++;
+            _value.Text = num < 0 ? "timeout" : $"{num} ms";
+            _value.ForeColor = num < 0 ? Color.FromArgb(230, 90, 90) : Color.FromArgb(80, 200, 255);
+            _graph.Invalidate();
         }
-        catch
+        finally
         {
-            num = -1;
+            _pingInProgress = false;
         }
-        _bars[_head] = num;
-        _head = (_head + 1) % 60;
-        if (_count < 60)
+    }
+
+    private void UpdateUsageDisplay()
+    {
+        _usageValue.Text = FormatCompactBytes(_usage.TotalBytes);
+        _usageTip.SetToolTip(_usageValue,
+            $"Resets daily at {_usage.ResetTime.ToString(@"hh\:mm")} (local time)\n" +
+            $"Download / received: {FormatCompactBytes(_usage.ReceivedBytes)}\n" +
+            $"Upload / sent: {FormatCompactBytes(_usage.SentBytes)}\n" +
+            "Windows network interface byte counters");
+    }
+
+    private void ShowNetworkData()
+    {
+        using var dialog = new NetworkDataDialog(_usage);
+        dialog.ShowDialog(this);
+        UpdateUsageDisplay();
+        CheckDailyUsageAlert();
+    }
+
+    private void ShowSetResetTimeDialog()
+    {
+        using var dialog = new ResetTimeDialog(_usage.ResetTime);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        _usage.SetResetTime(dialog.ResetTime);
+        UpdateUsageDisplay();
+        CheckDailyUsageAlert();
+    }
+
+    private void CheckDailyUsageAlert()
+    {
+        if (!_usage.ShouldShowThresholdAlert)
+            return;
+
+        _usage.MarkThresholdAlertSent();
+        _tray.ShowBalloonTip(
+            5000,
+            "Ping Monitor",
+            $"Network usage in this cycle exceeded 5 GB ({FormatBytes(_usage.TotalBytes)} total).",
+            ToolTipIcon.Info);
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB", "TB", "PB" };
+        double value = bytes;
+        int unit = 0;
+        while (value >= 1000 && unit < units.Length - 1)
         {
-            _count++;
+            value /= 1000;
+            unit++;
         }
-        _value.Text = ((num < 0) ? "timeout" : (num + " ms"));
-        _value.ForeColor = ((num < 0) ? Color.FromArgb(230, 90, 90) : Color.FromArgb(80, 200, 255));
-        _graph.Invalidate();
+        return unit == 0 ? $"{bytes} B" : $"{value:0.##} {units[unit]}";
+    }
+
+    private static string FormatCompactBytes(long bytes)
+    {
+        if (bytes < 1000) return $"{bytes}B";
+        string[] units = { "K", "M", "G", "T", "P" };
+        double value = bytes;
+        int unit = -1;
+        do
+        {
+            value /= 1000;
+            unit++;
+        } while (value >= 1000 && unit < units.Length - 1);
+        return $"{value:0.#}{units[unit]}";
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _timer.Stop();
+        _usageTimer.Stop();
+        _timer.Dispose();
+        _usageTimer.Dispose();
+        _usageTip.Dispose();
         _tray.Visible = false;
+        _tray.Dispose();
+        _trayIcon.Dispose();
         base.OnFormClosing(e);
     }
 
@@ -336,7 +474,7 @@ public class MainForm : Form
 
     private static Icon MakeIcon()
     {
-        Bitmap bitmap = new Bitmap(16, 16);
+        using Bitmap bitmap = new Bitmap(16, 16);
         using (Graphics graphics = Graphics.FromImage(bitmap))
         {
             graphics.Clear(Color.Transparent);
@@ -346,8 +484,21 @@ public class MainForm : Form
             graphics.DrawLine(pen, 8, 9, 11, 3);
             graphics.DrawLine(pen, 11, 3, 14, 8);
         }
-        return System.Drawing.Icon.FromHandle(bitmap.GetHicon());
+        IntPtr iconHandle = bitmap.GetHicon();
+        try
+        {
+            using Icon borrowedIcon = Icon.FromHandle(iconHandle);
+            return (Icon)borrowedIcon.Clone();
+        }
+        finally
+        {
+            DestroyIcon(iconHandle);
+        }
     }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 
     // Small input dialog in the same dark style as the widget
     private class SetHostDialog : Form
@@ -359,7 +510,7 @@ public class MainForm : Form
         {
             Text = "Set Host";
             FormBorderStyle = FormBorderStyle.FixedDialog;
-            StartPosition = FormStartPosition.CenterParent;
+            StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(320, 122);
             MaximizeBox = false;
             MinimizeBox = false;

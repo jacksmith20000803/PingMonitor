@@ -5,13 +5,20 @@
     <Nullable>disable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>PingMonitor_v2</AssemblyName>
+    <AssemblyName>PingMonitor</AssemblyName>
     <RootNamespace>PingMonitor</RootNamespace>
     <Version>1.1.0</Version>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <AssemblyTitle>Ping Monitor</AssemblyTitle>
     <AssemblyCompany>Your Name</AssemblyCompany>
     <AssemblyProduct>Ping Monitor</AssemblyProduct>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
     <AssemblyCopyright>Copyright © 2025</AssemblyCopyright>
   </PropertyGroup>
 </Project>
