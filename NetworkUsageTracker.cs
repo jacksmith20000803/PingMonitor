@@ -2,34 +2,44 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 
 /// <summary>
-/// Tracks Windows network interface byte counters and rolls the daily total over
-/// using the computer's local date.
+/// Tracks public IP traffic on physical Ethernet/Wi-Fi adapters and rolls the
+/// daily total over using the computer's local date.
 /// </summary>
 internal sealed class NetworkUsageTracker
 {
     public const long DailyAlertThresholdBytes = 5_000_000_000;
+    private const uint InterfaceTypeSoftwareLoopback = 24;
+    private const uint InterfaceTypeTunnel = 131;
+    private const byte InterfaceFlagHardware = 0x01;
 
     private readonly string _statePath;
+    private readonly string _legacyStatePath;
     private UsageState _state;
+    private readonly NpcapCapture _capture;
+    private readonly object _captureSync = new();
+    private long _pendingReceivedBytes;
+    private long _pendingSentBytes;
+    private bool _trafficEnabled;
+    private string _persistenceError;
 
-    public NetworkUsageTracker(string statePath)
+    public NetworkUsageTracker(string statePath, string legacyStatePath = null)
     {
         _statePath = statePath;
-        _state = LoadState();
-        _state.Adapters ??= new Dictionary<string, AdapterCounters>(StringComparer.OrdinalIgnoreCase);
+        _legacyStatePath = legacyStatePath;
+        bool migratingLegacyState = !File.Exists(_statePath) && !string.IsNullOrWhiteSpace(_legacyStatePath) && File.Exists(_legacyStatePath);
+        _state = LoadState(migratingLegacyState ? _legacyStatePath : _statePath);
         _state.History ??= new Dictionary<string, DailyUsage>(StringComparer.Ordinal);
 
-        // Earlier versions summed software and VPN adapters, which can overlap
-        // with hardware counters. Start a clean daily total for the new source.
-        if (_state.CounterVersion < 3 || _state.CounterVersion > 4)
+        // Packet-filtered Ethernet totals cannot be mixed with the old
+        // interface counters, so start a clean history for this source.
+        if (_state.CounterVersion != 6)
         {
             _state.ReceivedBytes = 0;
             _state.SentBytes = 0;
             _state.ThresholdAlertSent = false;
-            _state.Adapters.Clear();
             _state.History.Clear();
         }
-        _state.CounterVersion = 4;
+        _state.CounterVersion = 6;
 
         if (_state.ResetTime < TimeSpan.Zero || _state.ResetTime >= TimeSpan.FromDays(1))
             _state.ResetTime = TimeSpan.Zero;
@@ -42,15 +52,11 @@ internal sealed class NetworkUsageTracker
             _state.ReceivedBytes = 0;
             _state.SentBytes = 0;
             _state.ThresholdAlertSent = false;
-            _state.Adapters.Clear();
         }
 
-        // If Windows restarted while the widget was closed, interface counters
-        // may have restarted too. In that case, establish new baselines.
-        if (_state.LastUptimeMilliseconds > Environment.TickCount64)
-            _state.Adapters.Clear();
-
         Sample();
+        SaveState();
+        _capture = new NpcapCapture(AddCapturedTraffic);
     }
 
     public long ReceivedBytes => _state.ReceivedBytes;
@@ -59,6 +65,9 @@ internal sealed class NetworkUsageTracker
     public bool ThresholdAlertSent => _state.ThresholdAlertSent;
     public bool ShouldShowThresholdAlert => TotalBytes > DailyAlertThresholdBytes && !_state.ThresholdAlertSent;
     public TimeSpan ResetTime => _state.ResetTime;
+    public string CaptureStatus => !string.IsNullOrEmpty(_persistenceError)
+        ? $"Usage save failed: {_persistenceError}"
+        : _capture?.Status ?? "Starting Npcap capture";
 
     public DateOnly CurrentCycleDate => _state.Date;
 
@@ -91,6 +100,9 @@ internal sealed class NetworkUsageTracker
         return (received, sent);
     }
 
+    public bool HasUsageForDate(DateOnly date) =>
+        date == _state.Date || _state.History.ContainsKey(date.ToString("yyyy-MM-dd"));
+
     public void SetResetTime(TimeSpan resetTime)
     {
         if (resetTime < TimeSpan.Zero || resetTime >= TimeSpan.FromDays(1))
@@ -98,13 +110,13 @@ internal sealed class NetworkUsageTracker
         if (_state.ResetTime == resetTime)
             return;
 
+        Sample();
         ArchiveCurrentUsage();
         _state.ResetTime = resetTime;
         _state.Date = GetCycleDate(DateTime.Now, resetTime);
         _state.ReceivedBytes = 0;
         _state.SentBytes = 0;
         _state.ThresholdAlertSent = false;
-        _state.Adapters = ReadCounters() ?? new Dictionary<string, AdapterCounters>(StringComparer.OrdinalIgnoreCase);
         _state.LastUptimeMilliseconds = Environment.TickCount64;
         SaveState();
     }
@@ -127,31 +139,51 @@ internal sealed class NetworkUsageTracker
             _state.ThresholdAlertSent = false;
         }
 
-        var current = ReadCounters();
-        if (current is null)
-            return;
-
-        foreach (var item in current)
+        long received;
+        long sent;
+        lock (_captureSync)
         {
-            if (_state.Adapters.TryGetValue(item.Key, out var previous))
-            {
-                // A decrease means that the interface counter reset or wrapped.
-                // Establish a fresh baseline rather than inventing a delta.
-                if (item.Value.Received >= previous.Received)
-                    _state.ReceivedBytes = SaturatingAdd(_state.ReceivedBytes, item.Value.Received - previous.Received);
-                if (item.Value.Sent >= previous.Sent)
-                    _state.SentBytes = SaturatingAdd(_state.SentBytes, item.Value.Sent - previous.Sent);
-            }
+            received = _pendingReceivedBytes;
+            sent = _pendingSentBytes;
+            _pendingReceivedBytes = 0;
+            _pendingSentBytes = 0;
         }
-
-        _state.Adapters = current;
+        _state.ReceivedBytes = SaturatingAdd(_state.ReceivedBytes, received);
+        _state.SentBytes = SaturatingAdd(_state.SentBytes, sent);
         _state.LastUptimeMilliseconds = Environment.TickCount64;
         SaveState();
     }
 
-    private static Dictionary<string, AdapterCounters> ReadCounters()
+    private void AddCapturedTraffic(long received, long sent)
     {
-        var counters = new Dictionary<string, AdapterCounters>(StringComparer.OrdinalIgnoreCase);
+        lock (_captureSync)
+        {
+            if (!_trafficEnabled) return;
+            if (received > 0)
+                _pendingReceivedBytes = SaturatingAdd(_pendingReceivedBytes, received);
+            if (sent > 0)
+                _pendingSentBytes = SaturatingAdd(_pendingSentBytes, sent);
+        }
+    }
+
+    public void SetTrafficEnabled(bool enabled)
+    {
+        lock (_captureSync)
+        {
+            _trafficEnabled = enabled;
+            if (!enabled)
+            {
+                // Drop packets queued during the previous probe interval so a
+                // timeout cannot be added to the next online sample.
+                _pendingReceivedBytes = 0;
+                _pendingSentBytes = 0;
+            }
+        }
+    }
+
+    internal static HashSet<Guid> GetPhysicalInterfaceIds()
+    {
+        var ids = new HashSet<Guid>();
         IntPtr table = IntPtr.Zero;
         uint result = GetIfTable2(out table);
         if (result != 0 || table == IntPtr.Zero)
@@ -170,15 +202,9 @@ internal sealed class NetworkUsageTracker
             {
                 IntPtr rowPointer = IntPtr.Add(table, firstRowOffset + i * rowSize);
                 MibIfRow2 row = Marshal.PtrToStructure<MibIfRow2>(rowPointer);
-                bool hardwareInterface = (row.InterfaceAndOperStatusFlags & 0x01) != 0;
-                if (!hardwareInterface || row.OperStatus != 1 || row.Type is 24 or 131)
+                if (!IsTrackableInterface(row.Type, row.InterfaceAndOperStatusFlags, row.OperStatus))
                     continue;
-
-                counters[row.InterfaceGuid.ToString("B")] = new AdapterCounters
-                {
-                    Received = ToCounterValue(row.InOctets),
-                    Sent = ToCounterValue(row.OutOctets)
-                };
+                ids.Add(row.InterfaceGuid);
             }
         }
         catch
@@ -189,8 +215,16 @@ internal sealed class NetworkUsageTracker
         {
             FreeMibTable(table);
         }
-        return counters;
+        return ids;
     }
+
+    // Track physical network interfaces only. Packet capture uses these IDs to
+    // avoid loopback, VPN tunnel, and other software adapters.
+    internal static bool IsTrackableInterface(uint interfaceType, byte interfaceFlags, uint operationalStatus) =>
+        (interfaceFlags & InterfaceFlagHardware) != 0 &&
+        operationalStatus == 1 &&
+        interfaceType != InterfaceTypeSoftwareLoopback &&
+        interfaceType != InterfaceTypeTunnel;
 
     [DllImport("iphlpapi.dll")]
     private static extern uint GetIfTable2(out IntPtr table);
@@ -198,14 +232,17 @@ internal sealed class NetworkUsageTracker
     [DllImport("iphlpapi.dll")]
     private static extern void FreeMibTable(IntPtr memory);
 
-    private UsageState LoadState()
+    private UsageState LoadState(string path)
     {
         try
         {
-            if (File.Exists(_statePath))
-                return JsonSerializer.Deserialize<UsageState>(File.ReadAllText(_statePath)) ?? new UsageState();
+            if (File.Exists(path))
+                return JsonSerializer.Deserialize<UsageState>(File.ReadAllText(path)) ?? new UsageState();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _persistenceError = $"could not read saved usage ({ex.Message})";
+        }
         return new UsageState();
     }
 
@@ -218,15 +255,16 @@ internal sealed class NetworkUsageTracker
             string temporaryPath = _statePath + ".tmp";
             File.WriteAllText(temporaryPath, JsonSerializer.Serialize(_state));
             File.Move(temporaryPath, _statePath, true);
+            _persistenceError = null;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _persistenceError = ex.Message;
+        }
     }
 
     private static long SaturatingAdd(long total, long amount) =>
         amount > long.MaxValue - total ? long.MaxValue : total + amount;
-
-    private static long ToCounterValue(ulong value) =>
-        value > long.MaxValue ? long.MaxValue : (long)value;
 
     private void ArchiveCurrentUsage()
     {
@@ -257,14 +295,13 @@ internal sealed class NetworkUsageTracker
         public bool ThresholdAlertSent { get; set; }
         public long LastUptimeMilliseconds { get; set; }
         public int CounterVersion { get; set; }
-        public Dictionary<string, AdapterCounters> Adapters { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, DailyUsage> History { get; set; } = new(StringComparer.Ordinal);
     }
 
-    private sealed class AdapterCounters
+    public void Dispose()
     {
-        public long Received { get; set; }
-        public long Sent { get; set; }
+        _capture?.Dispose();
+        Sample();
     }
 
     private sealed class DailyUsage

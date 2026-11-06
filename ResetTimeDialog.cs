@@ -16,8 +16,8 @@ internal sealed class ResetTimeDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         ShowInTaskbar = false;
-        BackColor = Color.FromArgb(32, 33, 36);
-        ForeColor = Color.Gainsboro;
+        BackColor = Color.FromArgb(7, 15, 32);
+        ForeColor = Color.FromArgb(220, 232, 250);
         Font = new Font("Segoe UI", 9f);
 
         var label = new Label
@@ -40,7 +40,7 @@ internal sealed class ResetTimeDialog : Form
             Text = "Applying a different time starts a fresh usage cycle immediately.",
             Location = new Point(18, 91),
             Size = new Size(324, 24),
-            ForeColor = Color.Silver
+            ForeColor = Color.FromArgb(145, 169, 205)
         };
         var apply = new Button
         {
@@ -49,7 +49,7 @@ internal sealed class ResetTimeDialog : Form
             Location = new Point(174, 125),
             Size = new Size(78, 28),
             FlatStyle = FlatStyle.Flat,
-            BackColor = Color.FromArgb(0, 120, 215),
+            BackColor = Color.FromArgb(0, 126, 255),
             ForeColor = Color.White
         };
         var cancel = new Button
@@ -59,7 +59,7 @@ internal sealed class ResetTimeDialog : Form
             Location = new Point(262, 125),
             Size = new Size(80, 28),
             FlatStyle = FlatStyle.Flat,
-            BackColor = Color.FromArgb(62, 64, 68),
+            BackColor = Color.FromArgb(22, 39, 70),
             ForeColor = Color.White
         };
 
