@@ -45,15 +45,50 @@ public class MainForm : Form
 
     private readonly ToolTip _usageTip = new ToolTip();
 
+    private string _tooltipText = "Daily network usage. Right-click for network data and settings.";
+
     private readonly System.Windows.Forms.Timer _tooltipTimer;
 
-    private Point _lastTooltipCursor;
+    private Point _lastTooltipPosition;
 
-    private DateTime _tooltipStationarySince;
+    private DateTime _tooltipStationarySinceUtc;
 
     private bool _tooltipVisible;
 
-    private string _tooltipText = "Daily network usage. Right-click for network data and settings.";
+    private readonly System.Windows.Forms.Timer _resizeAnimationTimer;
+
+    private readonly System.Windows.Forms.Timer _desktopTimer;
+
+    private IVirtualDesktopManager _virtualDesktopManager;
+
+    private IApplicationViewCollection _applicationViewCollection;
+
+    private IVirtualDesktopPinnedApps _virtualDesktopPinnedApps;
+
+    private IServiceProvider _immersiveShellProvider;
+
+    private object _immersiveShellObject;
+
+    private bool _virtualDesktopPinned;
+
+    private ToolStripMenuItem _hideShowMenuItem;
+
+    private bool _compactModeEnabled;
+
+    private bool _compactTarget;
+
+    private int _animationStep;
+
+    private Size _animationStartSize;
+
+    private Size _animationTargetSize;
+
+    private const int CompactWidth = 66;
+
+    private const int CompactHeight = 68;
+
+    private bool ShouldDrawCompact => _compactTarget ||
+        (_resizeAnimationTimer.Enabled && _animationTargetSize.Width > _animationStartSize.Width);
 
     private readonly NetworkUsageTracker _usage;
 
@@ -102,6 +137,7 @@ public class MainForm : Form
         base.ClientSize = new Size(W, H);
         base.FormBorderStyle = FormBorderStyle.None;
         base.BackColor = Color.FromArgb(3, 10, 27);
+        base.TransparencyKey = Color.FromArgb(2, 8, 24);
         base.TopMost = true;
         base.ShowInTaskbar = false;
         base.StartPosition = FormStartPosition.Manual;
@@ -118,27 +154,46 @@ public class MainForm : Form
         _surface.MouseEnter += delegate
         {
             _surface.Cursor = Cursors.Hand;
-            ResetTooltipStationaryTime();
+            ResetTooltipTimer();
+            if (_compactModeEnabled && _compactTarget)
+                AnimateCompactMode(false);
         };
         _surface.MouseLeave += delegate
         {
             if (!_drag) _surface.Cursor = Cursors.Default;
             HideUsageTooltip();
+            _tooltipStationarySinceUtc = DateTime.UtcNow;
+            if (_compactModeEnabled && !_compactTarget &&
+                !_surface.ClientRectangle.Contains(_surface.PointToClient(Cursor.Position)))
+                AnimateCompactMode(true);
         };
         _surface.MouseClick += SurfaceMouseClick;
+        _usageTip.InitialDelay = 0;
+        _usageTip.ReshowDelay = 0;
         _usageTip.AutoPopDelay = 60000;
-        _lastTooltipCursor = Cursor.Position;
-        _tooltipStationarySince = DateTime.UtcNow;
-        _tooltipTimer = new System.Windows.Forms.Timer { Interval = 100 };
-        _tooltipTimer.Tick += delegate { UpdateUsageTooltip(); };
+        _lastTooltipPosition = Cursor.Position;
+        _tooltipStationarySinceUtc = DateTime.UtcNow;
+        _tooltipTimer = new System.Windows.Forms.Timer { Interval = 50 };
+        _tooltipTimer.Tick += UpdateUsageTooltip;
         _tooltipTimer.Start();
+        _resizeAnimationTimer = new System.Windows.Forms.Timer { Interval = 15 };
+        _resizeAnimationTimer.Tick += AnimateResizeTick;
+        _desktopTimer = new System.Windows.Forms.Timer { Interval = 250 };
+        _desktopTimer.Tick += KeepOnActiveVirtualDesktop;
+        _desktopTimer.Start();
         Controls.Add(_surface);
 
         var widgetMenu = new ContextMenuStrip();
         widgetMenu.Items.Add("Network Data", null, delegate { ShowNetworkData(); });
         widgetMenu.Items.Add("Set Reset Time...", null, delegate { ShowSetResetTimeDialog(); });
         widgetMenu.Items.Add("Set Host...", null, delegate { ShowSetHostDialog(); });
-        widgetMenu.Items.Add("Hide", null, delegate { Hide(); });
+        _hideShowMenuItem = new ToolStripMenuItem("Hide");
+        _hideShowMenuItem.Click += delegate
+        {
+            if (_compactModeEnabled) RestoreFullMode();
+            else AnimateCompactMode(true);
+        };
+        widgetMenu.Items.Add(_hideShowMenuItem);
         widgetMenu.Items.Add("Exit", null, delegate
         {
             _tray.Visible = false;
@@ -180,7 +235,8 @@ public class MainForm : Form
                     (Image)null,
                     (EventHandler)delegate
                     {
-                        base.Visible = !base.Visible;
+                        if (!Visible) Show();
+                        else RestoreFullMode();
                     }
                 },
                 {
@@ -323,10 +379,10 @@ public class MainForm : Form
     private void SurfaceMouseMove(object sender, MouseEventArgs e)
     {
         Point cursorPosition = Cursor.Position;
-        if (cursorPosition != _lastTooltipCursor)
+        if (cursorPosition != _lastTooltipPosition)
         {
-            _lastTooltipCursor = cursorPosition;
-            _tooltipStationarySince = DateTime.UtcNow;
+            _lastTooltipPosition = cursorPosition;
+            _tooltipStationarySinceUtc = DateTime.UtcNow;
             HideUsageTooltip();
         }
 
@@ -346,6 +402,11 @@ public class MainForm : Form
 
     private void SurfaceMouseClick(object sender, MouseEventArgs e)
     {
+        if (e.Button == MouseButtons.Left && _compactModeEnabled && _compactTarget)
+        {
+            RestoreFullMode();
+            return;
+        }
         if (e.Button != MouseButtons.Left)
             return;
 
@@ -397,13 +458,12 @@ public class MainForm : Form
         try
         {
             int num = await ProbeHostAsync(_host);
-            _usage.SetTrafficEnabled(num >= 0);
-
             _bars[_head] = num;
             _head = (_head + 1) % MaxBars;
             if (_count < MaxBars)
                 _count++;
             _currentPing = num;
+            _usage.RecordPingSample(num);
             _surface.Invalidate();
         }
         finally
@@ -469,33 +529,55 @@ public class MainForm : Form
             _usage.CaptureStatus;
     }
 
-    private void ResetTooltipStationaryTime()
+    private void AnimateCompactMode(bool compact)
     {
-        _lastTooltipCursor = Cursor.Position;
-        _tooltipStationarySince = DateTime.UtcNow;
+        _compactModeEnabled = compact || _compactModeEnabled;
+        _compactTarget = compact;
+        if (_hideShowMenuItem != null)
+            _hideShowMenuItem.Text = _compactModeEnabled ? "Show" : "Hide";
+        Size target = compact ? new Size(CompactWidth, CompactHeight) : new Size(W, H);
+        if (ClientSize == target) return;
+        _animationStartSize = ClientSize;
+        _animationTargetSize = target;
+        _animationStep = 0;
+        _resizeAnimationTimer.Start();
+    }
+
+    private void RestoreFullMode()
+    {
+        _compactModeEnabled = false;
+        if (_hideShowMenuItem != null) _hideShowMenuItem.Text = "Hide";
+        AnimateCompactMode(false);
+    }
+
+    private void ResetTooltipTimer()
+    {
+        _lastTooltipPosition = Cursor.Position;
+        _tooltipStationarySinceUtc = DateTime.UtcNow;
         HideUsageTooltip();
     }
 
-    private void UpdateUsageTooltip()
+    private void UpdateUsageTooltip(object sender, EventArgs e)
     {
-        if (!Visible || WindowState == FormWindowState.Minimized || !_surface.ClientRectangle.Contains(_surface.PointToClient(Cursor.Position)))
+        Point cursorPosition = Cursor.Position;
+        if (!Visible || WindowState == FormWindowState.Minimized ||
+            !_surface.ClientRectangle.Contains(_surface.PointToClient(cursorPosition)))
         {
             HideUsageTooltip();
             return;
         }
 
-        Point position = Cursor.Position;
-        if (position != _lastTooltipCursor)
+        if (cursorPosition != _lastTooltipPosition)
         {
-            _lastTooltipCursor = position;
-            _tooltipStationarySince = DateTime.UtcNow;
+            _lastTooltipPosition = cursorPosition;
+            _tooltipStationarySinceUtc = DateTime.UtcNow;
             HideUsageTooltip();
             return;
         }
 
-        if (!_tooltipVisible && DateTime.UtcNow - _tooltipStationarySince >= TimeSpan.FromSeconds(5))
+        if (!_tooltipVisible && DateTime.UtcNow - _tooltipStationarySinceUtc >= TimeSpan.FromSeconds(2))
         {
-            Point local = _surface.PointToClient(position);
+            Point local = _surface.PointToClient(cursorPosition);
             _usageTip.Show(_tooltipText, _surface, local.X + 12, local.Y + 18, 60000);
             _tooltipVisible = true;
         }
@@ -506,6 +588,154 @@ public class MainForm : Form
         if (!_tooltipVisible) return;
         _usageTip.Hide(_surface);
         _tooltipVisible = false;
+    }
+
+    private void AnimateResizeTick(object sender, EventArgs e)
+    {
+        const int steps = 10;
+        _animationStep++;
+        float progress = Math.Min(1f, _animationStep / (float)steps);
+        float eased = 1f - (float)Math.Pow(1f - progress, 3);
+        int width = (int)Math.Round(_animationStartSize.Width + (_animationTargetSize.Width - _animationStartSize.Width) * eased);
+        int height = (int)Math.Round(_animationStartSize.Height + (_animationTargetSize.Height - _animationStartSize.Height) * eased);
+        ClientSize = new Size(width, height);
+        _surface.Invalidate();
+        if (_animationStep < steps) return;
+        _resizeAnimationTimer.Stop();
+        ClientSize = _animationTargetSize;
+    }
+
+    private void KeepOnActiveVirtualDesktop(object sender, EventArgs e)
+    {
+        try
+        {
+            if (!_virtualDesktopPinned && TryPinOnAllDesktops())
+            {
+                _virtualDesktopPinned = true;
+                _desktopTimer.Stop();
+                return;
+            }
+            if (_virtualDesktopPinned) return;
+            IntPtr foreground = NativeMethods.GetForegroundWindow();
+            IntPtr shell = NativeMethods.GetShellWindow();
+            Guid activeDesktop = Guid.Empty;
+            _virtualDesktopManager ??= (IVirtualDesktopManager)new VirtualDesktopManager();
+            bool foundDesktop = foreground != IntPtr.Zero && foreground != Handle &&
+                _virtualDesktopManager.GetWindowDesktopId(foreground, out activeDesktop) == 0;
+            if (!foundDesktop && shell != IntPtr.Zero)
+                foundDesktop = _virtualDesktopManager.GetWindowDesktopId(shell, out activeDesktop) == 0;
+            if (foundDesktop &&
+                _virtualDesktopManager.GetWindowDesktopId(Handle, out Guid currentDesktop) == 0 && activeDesktop != currentDesktop)
+                _virtualDesktopManager.MoveWindowToDesktop(Handle, ref activeDesktop);
+        }
+        catch { }
+    }
+
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        KeepOnActiveVirtualDesktop(this, EventArgs.Empty);
+    }
+
+    private bool TryPinOnAllDesktops()
+    {
+        try
+        {
+            NativeMethods.SetCurrentProcessExplicitAppUserModelID("PingMonitor.Overlay");
+            if (_applicationViewCollection == null || _virtualDesktopPinnedApps == null)
+            {
+                Guid immersiveShellClsid = new("C2F03A33-21F5-47FA-B4BB-156362A2F239");
+                Guid pinnedAppsService = new("B5A399E7-1C87-46B8-88E9-FC5747B171BD");
+                Guid pinnedAppsIid = typeof(IVirtualDesktopPinnedApps).GUID;
+                Guid appViewCollectionService = typeof(IApplicationViewCollection).GUID;
+                Guid appViewCollectionIid = appViewCollectionService;
+                _immersiveShellObject = Activator.CreateInstance(Type.GetTypeFromCLSID(immersiveShellClsid));
+                _immersiveShellProvider = (IServiceProvider)_immersiveShellObject;
+                _immersiveShellProvider.QueryService(ref appViewCollectionService, ref appViewCollectionIid, out object views);
+                _applicationViewCollection = (IApplicationViewCollection)views;
+                _immersiveShellProvider.QueryService(ref pinnedAppsService, ref pinnedAppsIid, out object pinnedApps);
+                _virtualDesktopPinnedApps = (IVirtualDesktopPinnedApps)pinnedApps;
+            }
+
+            _applicationViewCollection.GetViewForHwnd(Handle, out IApplicationView view);
+            if (view != null)
+            {
+                if (!_virtualDesktopPinnedApps.IsViewPinned(view))
+                    _virtualDesktopPinnedApps.PinView(view);
+                if (_virtualDesktopPinnedApps.IsViewPinned(view)) return true;
+            }
+
+            const string appUserModelId = "PingMonitor.Overlay";
+            if (!_virtualDesktopPinnedApps.IsAppIdPinned(appUserModelId))
+                _virtualDesktopPinnedApps.PinAppID(appUserModelId);
+            return _virtualDesktopPinnedApps.IsAppIdPinned(appUserModelId);
+        }
+        catch { return false; }
+    }
+
+    [ComImport]
+    [Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")]
+    [ClassInterface(ClassInterfaceType.None)]
+    private class VirtualDesktopManager { }
+
+    [ComImport]
+    [Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IVirtualDesktopManager
+    {
+        [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, [MarshalAs(UnmanagedType.Bool)] out bool onCurrentDesktop);
+        [PreserveSig] int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+        [PreserveSig] int MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
+    }
+
+    [ComImport]
+    [Guid("6D5140C1-7436-11CE-8034-00AA006009FA")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IServiceProvider
+    {
+        void QueryService(ref Guid service, ref Guid interfaceId,
+            [MarshalAs(UnmanagedType.Interface)] out object instance);
+    }
+
+    [ComImport]
+    [Guid("1841C6D7-4F9D-42C0-AF41-8747538F10E5")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IApplicationViewCollection
+    {
+        int GetViews(IntPtr views);
+        int GetViewsByZOrder(IntPtr views);
+        int GetViewsByAppUserModelId([MarshalAs(UnmanagedType.LPWStr)] string appId, IntPtr views);
+        int GetViewForHwnd(IntPtr hwnd, [MarshalAs(UnmanagedType.Interface)] out IApplicationView view);
+    }
+
+    [ComImport]
+    [Guid("372E1D3B-38D3-42E4-A15B-8AB2B178F513")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IApplicationView { }
+
+    [ComImport]
+    [Guid("4CE81583-1E4C-4632-A621-07A53543148F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IVirtualDesktopPinnedApps
+    {
+        [return: MarshalAs(UnmanagedType.Bool)] bool IsAppIdPinned([MarshalAs(UnmanagedType.LPWStr)] string appId);
+        void PinAppID([MarshalAs(UnmanagedType.LPWStr)] string appId);
+        void UnpinAppID([MarshalAs(UnmanagedType.LPWStr)] string appId);
+        [return: MarshalAs(UnmanagedType.Bool)] bool IsViewPinned([MarshalAs(UnmanagedType.Interface)] IApplicationView view);
+        void PinView([MarshalAs(UnmanagedType.Interface)] IApplicationView view);
+        void UnpinView([MarshalAs(UnmanagedType.Interface)] IApplicationView view);
+    }
+
+    private static class NativeMethods
+    {
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetShellWindow();
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+        internal static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
     }
 
     private void ShowNetworkData()
@@ -591,11 +821,26 @@ public class MainForm : Form
         _usageTip.Dispose();
         _tooltipTimer.Stop();
         _tooltipTimer.Dispose();
+        _resizeAnimationTimer.Stop();
+        _resizeAnimationTimer.Dispose();
+        _desktopTimer.Stop();
+        _desktopTimer.Dispose();
+        ReleaseComObject(_virtualDesktopManager);
+        ReleaseComObject(_applicationViewCollection);
+        ReleaseComObject(_virtualDesktopPinnedApps);
+        ReleaseComObject(_immersiveShellProvider);
+        ReleaseComObject(_immersiveShellObject);
         _usage.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         _trayIcon.Dispose();
         base.OnFormClosing(e);
+    }
+
+    private static void ReleaseComObject(object value)
+    {
+        if (value != null && Marshal.IsComObject(value))
+            Marshal.ReleaseComObject(value);
     }
 
     private sealed class DashboardSurface : Control
@@ -604,6 +849,8 @@ public class MainForm : Form
         private static readonly Color Cyan = Color.FromArgb(0, 220, 255);
         private static readonly Color Blue = Color.FromArgb(0, 126, 255);
         private static readonly Color Green = Color.FromArgb(0, 236, 126);
+        private static readonly Color Tangerine = Color.FromArgb(255, 140, 26);
+        private static readonly Color AlertRed = Color.FromArgb(241, 70, 85);
         private static readonly Color Violet = Color.FromArgb(170, 83, 255);
 
         public static readonly Rectangle SettingsBounds = new(136, 1, 20, 19);
@@ -624,12 +871,45 @@ public class MainForm : Form
             Graphics g = e.Graphics;
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            if (_owner.ShouldDrawCompact)
+            {
+                DrawCompact(g);
+                return;
+            }
             g.Clear(Color.FromArgb(2, 8, 24));
             DrawFrame(g);
             DrawHeader(g);
             DrawGauge(g);
             DrawChart(g);
             DrawFooter(g);
+        }
+
+        private void DrawCompact(Graphics g)
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.Clear(Color.FromArgb(2, 8, 24));
+            using var compactBackground = new SolidBrush(Color.FromArgb(8, 18, 36));
+            g.FillRectangle(compactBackground, 0, 0, CompactWidth, CompactHeight);
+            bool online = _owner.CurrentPing >= 0;
+            Color accent = online ? Green : Color.FromArgb(255, 84, 112);
+            RectangleF ring = new(11, 3, 44, 44);
+            using Pen track = new(Color.FromArgb(220, 215, 224, 232), 4f)
+            { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round };
+            using Pen arc = new(accent, 3.5f)
+            { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round };
+            g.DrawArc(track, ring, 135, 270);
+            g.DrawArc(arc, ring, 135, online ? GetPingSweep(_owner.CurrentPing) : 14f);
+
+            string value = online ? _owner.CurrentPing.ToString() : "—";
+            using Font pingFont = new("Segoe UI", value.Length > 3 ? 9f : 11f, FontStyle.Bold);
+            using Font msFont = new("Segoe UI", 7.5f, FontStyle.Bold);
+            using var textBrush = new SolidBrush(accent);
+            DrawCentered(g, value, pingFont, textBrush, new RectangleF(14, 14, 38, 15));
+            DrawCentered(g, "ms", msFont, textBrush, new RectangleF(14, 29, 38, 11));
+            using Font statusFont = new("Segoe UI", 8f, FontStyle.Bold);
+            using var statusBrush = new SolidBrush(accent);
+            DrawCentered(g, online ? "ONLINE" : "OFFLINE", statusFont, statusBrush, new RectangleF(1, 51, CompactWidth - 2, 14));
         }
 
         private void DrawFrame(Graphics g)
@@ -706,6 +986,8 @@ public class MainForm : Form
             using Pen guide = new(Color.FromArgb(80, 0, 165, 225), .7f)
             { DashStyle = System.Drawing.Drawing2D.DashStyle.Dash };
             g.DrawLine(guide, 59, 36, 170, 36);
+            using Pen onlineBar = new(Cyan, 1.2f);
+            using Pen timeoutBar = new(Color.FromArgb(255, 89, 116), 1.2f);
             int max = 1;
             for (int i = 0; i < _owner._count; i++)
                 max = Math.Max(max, Math.Max(0, _owner._bars[i]));
@@ -718,11 +1000,7 @@ public class MainForm : Form
                 int sample = _owner._bars[index];
                 float height = sample < 0 ? 2.5f : Math.Max(3, sample / (float)max * 31f);
                 float x = 60 + i * step;
-                RectangleF bar = new(x, baseline - height, 1.2f, height);
-                using var brush = new LinearGradientBrush(bar,
-                    sample < 0 ? Color.FromArgb(255, 89, 116) : Cyan,
-                    sample < 0 ? Color.FromArgb(211, 55, 91) : Blue, 90f);
-                g.FillRectangle(brush, bar);
+                g.DrawLine(sample < 0 ? timeoutBar : onlineBar, x, baseline, x, baseline - height);
             }
 
             if (_owner._usage.TotalBytes >= NetworkUsageTracker.DailyAlertThresholdBytes)
@@ -732,18 +1010,16 @@ public class MainForm : Form
 
         private static void DrawWarning(Graphics g, float centerX, float centerY, float size, long totalBytes)
         {
-            Color warning = totalBytes >= 10_000_000_000L
-                ? Color.FromArgb(232, 54, 73)
-                : Color.FromArgb(35, 91, 205);
+            Color warning = totalBytes >= 10_000_000_000L ? AlertRed : Tangerine;
             PointF[] triangle =
             {
                 new(centerX, centerY - size * .58f),
                 new(centerX + size * .56f, centerY + size * .44f),
                 new(centerX - size * .56f, centerY + size * .44f)
             };
-            using var halo = new SolidBrush(Color.FromArgb(60, warning));
+            using var halo = new SolidBrush(Color.FromArgb(55, warning));
             using var fill = new SolidBrush(warning);
-            using var border = new Pen(Color.FromArgb(220, 155, 221, 255), 1.2f);
+            using var border = new Pen(Color.FromArgb(235, 255, 207, 132), 1.3f);
             g.FillEllipse(halo, centerX - size * .72f, centerY - size * .72f, size * 1.44f, size * 1.44f);
             g.FillPolygon(fill, triangle);
             g.DrawPolygon(border, triangle);

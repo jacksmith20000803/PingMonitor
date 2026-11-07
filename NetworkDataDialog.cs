@@ -184,7 +184,9 @@ internal sealed class NetworkDataDialog : Form
         _totalBytes = SaturatingAdd(_receivedBytes, _sentBytes);
         _captureStatus = _usage.CaptureStatus;
         _resetTime = _usage.ResetTime;
-        _pingSamples = _pingHistoryProvider?.Invoke() ?? Array.Empty<int>();
+        _pingSamples = _selectedDate == _usage.CurrentCycleDate
+            ? _pingHistoryProvider?.Invoke() ?? Array.Empty<int>()
+            : _usage.GetPingSamplesForDate(_selectedDate);
         _validPings = _pingSamples.Where(value => value >= 0).ToArray();
         _latestPing = _pingSamples.Length == 0 ? -1 : _pingSamples[^1];
         _surface.Invalidate();
@@ -222,6 +224,8 @@ internal sealed class NetworkDataDialog : Form
         private static readonly Color Cyan = Color.FromArgb(66, 224, 255);
         private static readonly Color Blue = Color.FromArgb(0, 139, 255);
         private static readonly Color Green = Color.FromArgb(45, 239, 130);
+        private static readonly Color Tangerine = Color.FromArgb(255, 140, 26);
+        private static readonly Color AlertRed = Color.FromArgb(241, 70, 85);
         private static readonly Color Violet = Color.FromArgb(145, 67, 255);
         public static readonly Rectangle CloseBounds = new(838, 12, 48, 54);
         public static readonly Rectangle DateSelectorBounds = new(618, 114, 230, 58);
@@ -313,21 +317,26 @@ internal sealed class NetworkDataDialog : Form
             using var cyanBrush = new SolidBrush(Cyan);
             g.DrawString("Monitor", monitorFont, cyanBrush, 208, 27);
 
-            using Pen closePen = new(Color.FromArgb(176, 207, 251), 5f)
+            using Pen closePen = new(Color.FromArgb(176, 207, 251), 3.5f)
             { StartCap = LineCap.Round, EndCap = LineCap.Round };
-            g.DrawLine(closePen, 850, 27, 874, 51);
-            g.DrawLine(closePen, 874, 27, 850, 51);
+            g.DrawLine(closePen, 856, 33, 870, 47);
+            g.DrawLine(closePen, 870, 33, 856, 47);
         }
 
         private void DrawUsageSummary(Graphics g)
         {
             const float cx = 137, cy = 181, radius = 70;
             RectangleF ring = new(cx - radius, cy - radius, radius * 2, radius * 2);
+            Color usageColor = _owner._totalBytes >= 10_000_000_000L
+                ? AlertRed
+                : _owner._totalBytes >= NetworkUsageTracker.DailyAlertThresholdBytes
+                    ? Tangerine
+                    : Green;
             using Pen track = new(Color.FromArgb(40, 89, 148, 125), 10f)
             { StartCap = LineCap.Round, EndCap = LineCap.Round };
-            using Pen halo = new(Color.FromArgb(28, Green), 19f)
+            using Pen halo = new(Color.FromArgb(28, usageColor), 19f)
             { StartCap = LineCap.Round, EndCap = LineCap.Round };
-            using Pen arc = new(Green, 8f)
+            using Pen arc = new(usageColor, 8f)
             { StartCap = LineCap.Round, EndCap = LineCap.Round };
             g.DrawArc(track, ring, 135, 270);
             g.DrawArc(halo, ring, 135, 270);
@@ -408,9 +417,9 @@ internal sealed class NetworkDataDialog : Form
                     (long received, long sent) = _owner._usage.GetUsageForDate(date);
                     long total = SaturatingAdd(received, sent);
                     marker = total >= 10_000_000_000L
-                        ? Color.FromArgb(241, 70, 85)
+                        ? AlertRed
                         : total >= NetworkUsageTracker.DailyAlertThresholdBytes
-                            ? Color.FromArgb(37, 104, 224)
+                            ? Tangerine
                             : Color.FromArgb(34, 222, 128);
                     float diameter = 26f;
                     RectangleF circle = new(cell.X + (cell.Width - diameter) / 2f,
@@ -462,8 +471,12 @@ internal sealed class NetworkDataDialog : Form
             g.DrawLine(divider, 52, 324, 848, 324);
             DrawPingBars(g, chart);
             if (_owner._totalBytes >= NetworkUsageTracker.DailyAlertThresholdBytes)
-                DrawWarning(g, chart.Left + chart.Width / 2f, chart.Top + chart.Height / 2f,
-                    18 + _owner._warningPulseStep, _owner._totalBytes);
+            {
+                float plotTop = 324f;
+                float plotCenterY = plotTop + (chart.Bottom - plotTop) / 2f;
+                DrawWarning(g, chart.Left + chart.Width / 2f, plotCenterY,
+                    44 + _owner._warningPulseStep, _owner._totalBytes);
+            }
         }
 
         private void DrawPingStatistics(Graphics g)
@@ -494,32 +507,33 @@ internal sealed class NetworkDataDialog : Form
             const float width = 10f;
             const float step = 13.15f;
             int max = Math.Max(1, _owner._validPings.DefaultIfEmpty(1).Max());
+            using var normalFill = new LinearGradientBrush(chart,
+                Color.FromArgb(54, 218, 255), Color.FromArgb(0, 112, 239), 90f);
+            using var timeoutFill = new LinearGradientBrush(chart,
+                Color.FromArgb(255, 85, 110), Color.FromArgb(191, 51, 83), 90f);
             for (int i = 0; i < _owner._pingSamples.Length && i < 60; i++)
             {
                 int ping = _owner._pingSamples[i];
                 float barHeight = ping < 0 ? 4 : Math.Max(6, ping / (float)max * 81);
                 RectangleF bar = new(left + i * step, baseline - barHeight, width, barHeight);
-                using var barFill = new LinearGradientBrush(bar,
-                    ping < 0 ? Color.FromArgb(255, 85, 110) : Color.FromArgb(54, 218, 255),
-                    ping < 0 ? Color.FromArgb(191, 51, 83) : Color.FromArgb(0, 112, 239), 90f);
-                FillRoundRect(g, barFill, bar, 4);
+                FillRoundRect(g, ping < 0 ? timeoutFill : normalFill, bar, 4);
             }
         }
 
         private static void DrawWarning(Graphics g, float centerX, float centerY, float size, long totalBytes)
         {
             Color warning = totalBytes >= 10_000_000_000L
-                ? Color.FromArgb(232, 54, 73)
-                : Color.FromArgb(35, 91, 205);
+                ? AlertRed
+                : Tangerine;
             PointF[] triangle =
             {
                 new(centerX, centerY - size * .58f),
                 new(centerX + size * .56f, centerY + size * .44f),
                 new(centerX - size * .56f, centerY + size * .44f)
             };
-            using var halo = new SolidBrush(Color.FromArgb(60, warning));
+            using var halo = new SolidBrush(Color.FromArgb(55, warning));
             using var fill = new SolidBrush(warning);
-            using var border = new Pen(Color.FromArgb(220, 155, 221, 255), 1.2f);
+            using var border = new Pen(Color.FromArgb(235, 255, 207, 132), 1.3f);
             g.FillEllipse(halo, centerX - size * .72f, centerY - size * .72f, size * 1.44f, size * 1.44f);
             g.FillPolygon(fill, triangle);
             g.DrawPolygon(border, triangle);
@@ -598,6 +612,8 @@ internal sealed class NetworkDataDialog : Form
             g.DrawArc(cyan, x, y, 50, 34, 222, 96);
             g.DrawArc(cyan, x + 10, y + 10, 30, 22, 222, 96);
             g.DrawArc(green, x + 19, y + 20, 12, 9, 222, 96);
+            using var statusDot = new SolidBrush(Color.FromArgb(0, 236, 137));
+            g.FillEllipse(statusDot, x + 21.5f, y + 28.5f, 7f, 7f);
         }
 
         private static void DrawPingIcon(Graphics g, float x, float y)

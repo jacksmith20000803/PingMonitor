@@ -16,10 +16,8 @@ internal sealed class NetworkUsageTracker
     private readonly string _legacyStatePath;
     private UsageState _state;
     private readonly NpcapCapture _capture;
-    private readonly object _captureSync = new();
     private long _pendingReceivedBytes;
     private long _pendingSentBytes;
-    private bool _trafficEnabled;
     private string _persistenceError;
 
     public NetworkUsageTracker(string statePath, string legacyStatePath = null)
@@ -29,6 +27,9 @@ internal sealed class NetworkUsageTracker
         bool migratingLegacyState = !File.Exists(_statePath) && !string.IsNullOrWhiteSpace(_legacyStatePath) && File.Exists(_legacyStatePath);
         _state = LoadState(migratingLegacyState ? _legacyStatePath : _statePath);
         _state.History ??= new Dictionary<string, DailyUsage>(StringComparer.Ordinal);
+        _state.PingSamples ??= new List<int>();
+        foreach (DailyUsage dailyUsage in _state.History.Values)
+            dailyUsage.PingSamples ??= new List<int>();
 
         // Packet-filtered Ethernet totals cannot be mixed with the old
         // interface counters, so start a clean history for this source.
@@ -37,6 +38,7 @@ internal sealed class NetworkUsageTracker
             _state.ReceivedBytes = 0;
             _state.SentBytes = 0;
             _state.ThresholdAlertSent = false;
+            _state.PingSamples.Clear();
             _state.History.Clear();
         }
         _state.CounterVersion = 6;
@@ -103,6 +105,22 @@ internal sealed class NetworkUsageTracker
     public bool HasUsageForDate(DateOnly date) =>
         date == _state.Date || _state.History.ContainsKey(date.ToString("yyyy-MM-dd"));
 
+    public int[] GetPingSamplesForDate(DateOnly date)
+    {
+        if (date == _state.Date)
+            return _state.PingSamples.ToArray();
+        return _state.History.TryGetValue(date.ToString("yyyy-MM-dd"), out DailyUsage archived)
+            ? archived.PingSamples.ToArray()
+            : Array.Empty<int>();
+    }
+
+    public void RecordPingSample(int milliseconds)
+    {
+        _state.PingSamples.Add(milliseconds);
+        if (_state.PingSamples.Count > 60)
+            _state.PingSamples.RemoveRange(0, _state.PingSamples.Count - 60);
+    }
+
     public void SetResetTime(TimeSpan resetTime)
     {
         if (resetTime < TimeSpan.Zero || resetTime >= TimeSpan.FromDays(1))
@@ -117,6 +135,7 @@ internal sealed class NetworkUsageTracker
         _state.ReceivedBytes = 0;
         _state.SentBytes = 0;
         _state.ThresholdAlertSent = false;
+        _state.PingSamples.Clear();
         _state.LastUptimeMilliseconds = Environment.TickCount64;
         SaveState();
     }
@@ -137,17 +156,11 @@ internal sealed class NetworkUsageTracker
             _state.ReceivedBytes = 0;
             _state.SentBytes = 0;
             _state.ThresholdAlertSent = false;
+            _state.PingSamples.Clear();
         }
 
-        long received;
-        long sent;
-        lock (_captureSync)
-        {
-            received = _pendingReceivedBytes;
-            sent = _pendingSentBytes;
-            _pendingReceivedBytes = 0;
-            _pendingSentBytes = 0;
-        }
+        long received = Interlocked.Exchange(ref _pendingReceivedBytes, 0);
+        long sent = Interlocked.Exchange(ref _pendingSentBytes, 0);
         _state.ReceivedBytes = SaturatingAdd(_state.ReceivedBytes, received);
         _state.SentBytes = SaturatingAdd(_state.SentBytes, sent);
         _state.LastUptimeMilliseconds = Environment.TickCount64;
@@ -156,29 +169,10 @@ internal sealed class NetworkUsageTracker
 
     private void AddCapturedTraffic(long received, long sent)
     {
-        lock (_captureSync)
-        {
-            if (!_trafficEnabled) return;
-            if (received > 0)
-                _pendingReceivedBytes = SaturatingAdd(_pendingReceivedBytes, received);
-            if (sent > 0)
-                _pendingSentBytes = SaturatingAdd(_pendingSentBytes, sent);
-        }
-    }
-
-    public void SetTrafficEnabled(bool enabled)
-    {
-        lock (_captureSync)
-        {
-            _trafficEnabled = enabled;
-            if (!enabled)
-            {
-                // Drop packets queued during the previous probe interval so a
-                // timeout cannot be added to the next online sample.
-                _pendingReceivedBytes = 0;
-                _pendingSentBytes = 0;
-            }
-        }
+        if (received > 0)
+            Interlocked.Add(ref _pendingReceivedBytes, received);
+        if (sent > 0)
+            Interlocked.Add(ref _pendingSentBytes, sent);
     }
 
     internal static HashSet<Guid> GetPhysicalInterfaceIds()
@@ -273,6 +267,7 @@ internal sealed class NetworkUsageTracker
             archived = new DailyUsage();
         archived.ReceivedBytes = SaturatingAdd(archived.ReceivedBytes, _state.ReceivedBytes);
         archived.SentBytes = SaturatingAdd(archived.SentBytes, _state.SentBytes);
+        archived.PingSamples = new List<int>(_state.PingSamples);
         _state.History[key] = archived;
     }
 
@@ -296,6 +291,7 @@ internal sealed class NetworkUsageTracker
         public long LastUptimeMilliseconds { get; set; }
         public int CounterVersion { get; set; }
         public Dictionary<string, DailyUsage> History { get; set; } = new(StringComparer.Ordinal);
+        public List<int> PingSamples { get; set; } = new();
     }
 
     public void Dispose()
@@ -310,6 +306,7 @@ internal sealed class NetworkUsageTracker
 
         public long ReceivedBytes { get; set; }
         public long SentBytes { get; set; }
+        public List<int> PingSamples { get; set; } = new();
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
